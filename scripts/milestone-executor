@@ -1,0 +1,498 @@
+#!/usr/bin/env node
+/**
+ * Milestone Execution v3.0 - 核心执行器
+ * 
+ * 用法:
+ *   milestone-executor start "任务描述" "m1|m2|m3"
+ *   milestone-executor continue <workSessionKey>
+ *   milestone-executor stop <workSessionKey>
+ *   milestone-executor status
+ *   milestone-executor retry <workSessionKey>
+ *   milestone-executor skip <workSessionKey>
+ *   milestone-executor rollback
+ *   milestone-executor modify <workSessionKey> "新方向"
+ *   milestone-executor recover
+ *   milestone-executor get-prompt "任务" "m1|m2|m3"
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const STATE_FILE = '.milestone-state.json';
+const WORK_SESSION_PROMPT_FILE = '.work-session-prompt.txt';
+
+// ============== 状态管理 ==============
+
+function loadState() {
+  if (fs.existsSync(STATE_FILE)) {
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  }
+  return null;
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ============== 工作会话 Prompt 生成 ==============
+
+function generateWorkSessionPrompt(task, milestones, mainSessionKey) {
+  const milestoneList = milestones.map((m, i) => `  ${i + 1}. ${m}`).join('\n');
+  
+  return `你是 milestone-execution skill 的工作会话。
+
+## 任务
+${task}
+
+## Milestone 计划
+${milestoneList}
+
+## 执行规则（强制）
+1. 你在单一工作会话中执行所有 milestone
+2. 每个 milestone 完成后：
+   a. 更新本地 .milestone-state.json（status: completed）
+   b. 生成汇报（格式见下方）
+   c. 调用 sessions_send 发送到主会话（主会话 sessionKey: ${mainSessionKey}）
+   d. 调用 sessions_yield() 暂停，等待主会话指令
+3. 你会收到主会话发来的指令：
+   - "continue" → 执行下一个 milestone
+   - "retry" → 重新执行当前 milestone
+   - "skip" → 跳过当前，继续下一个
+   - "rollback" → 恢复到上一个完成的 milestone
+   - "modify: ..." → 根据指示修改当前 milestone
+   - "stop" → 清理状态，永久暂停
+4. 所有 milestone 完成后：
+   - 生成最终汇报
+   - sessions_send 发送到主会话
+   - sessions_yield() 永久暂停
+
+## 状态文件更新
+每个 milestone 完成后，更新 .milestone-state.json：
+- currentMilestone += 1
+- 对应 milestone 的 status 改为 "completed"
+- lastUpdated 改为当前时间
+
+## 汇报格式（每个 milestone 完成后）
+用 sessions_send 发送以下格式到主会话：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 Milestone {n}/{total} 完成
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ 已完成：
+   • [具体完成内容]
+
+📁 输出文件：
+   • [相关文件]
+
+⏱️ 用时：{duration}
+
+🎯 整体进度：
+   [{bar}] {percent}%
+   Milestone 1: ✅
+   Milestone 2: ✅
+   Milestone 3: 🔄 即将开始
+   ...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ "继续" 执行下一阶段
+→ "retry" 重试当前
+→ "skip" 跳过当前
+→ "rollback" 回滚
+→ "修改 X" 调整当前方向
+→ "停止" 结束任务
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## 最终汇报格式
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ 任务完成
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📜 Milestone 历史：
+   [1] ✅ 阶段1 - {time}
+   [2] ✅ 阶段2 - {time}
+   ...
+
+总用时：{total_duration}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## 状态文件格式
+在当前目录创建/更新 .milestone-state.json：
+{
+  "task": "任务名称",
+  "totalMilestones": N,
+  "currentMilestone": 1,
+  "workSessionKey": "你当前的 sessionKey",
+  "milestones": [
+    { "id": 1, "task": "m1", "status": "pending", "output": null, "duration": null },
+    { "id": 2, "task": "m2", "status": "pending", "output": null, "duration": null }
+  ],
+  "createdAt": "ISO时间",
+  "lastUpdated": "ISO时间"
+}
+
+开始执行第一个 milestone。`;
+}
+
+// ============== 命令处理 ==============
+
+function cmdStart(task, milestonesStr) {
+  const milestones = milestonesStr.split('|').map(m => m.trim());
+  
+  // 创建状态文件
+  const state = {
+    task,
+    totalMilestones: milestones.length,
+    currentMilestone: 1,
+    workSessionKey: null, // 启动后由主会话填充
+    milestones: milestones.map((m, i) => ({
+      id: i + 1,
+      task: m,
+      status: 'pending',
+      output: null,
+      duration: null,
+      dependsOn: i > 0 ? [i] : []
+    })),
+    createdAt: new Date().toISOString(),
+    lastUpdated: new Date().toISOString()
+  };
+  saveState(state);
+  
+  // 保存 prompt 供主会话使用
+  const mainSessionKey = '${MAIN_SESSION_KEY}'; // 占位符，由主会话替换
+  const prompt = generateWorkSessionPrompt(task, milestones, mainSessionKey);
+  fs.writeFileSync(WORK_SESSION_PROMPT_FILE, prompt);
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'start',
+    state: state,
+    message: '状态文件已创建。请使用 sessions_spawn 启动工作会话。',
+    promptFile: WORK_SESSION_PROMPT_FILE,
+    instruction: `请执行以下步骤：
+
+1. 读取 ${WORK_SESSION_PROMPT_FILE} 获取工作会话的完整 prompt
+2. 调用 sessions_spawn 启动工作会话：
+   - runtime: "subagent"
+   - task: <读取的prompt内容>
+   - mode: "run"
+3. 将返回的 sessionKey 记录到 .milestone-state.json 的 workSessionKey 字段
+4. 工作会话将自动开始执行第一个 milestone`
+  }, null, 2));
+}
+
+function cmdContinue(workSessionKey) {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件，请先执行"开始"' }));
+    return;
+  }
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'continue',
+    instruction: `请向工作会话发送 continue 指令：
+
+sessions_send("${workSessionKey}", "continue")
+
+工作会话收到后将执行下一个 milestone。`
+  }, null, 2));
+}
+
+function cmdStop(workSessionKey) {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'stop',
+    instruction: `请向工作会话发送 stop 指令：
+
+sessions_send("${workSessionKey}", "stop")
+
+工作会话收到后将清理状态并永久暂停。`
+  }, null, 2));
+}
+
+function cmdStatus() {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  // 生成进度条
+  const completed = state.milestones.filter(m => m.status === 'completed').length;
+  const percent = Math.round((completed / state.totalMilestones) * 100);
+  const bar = '█'.repeat(Math.floor(percent / 5)) + '░'.repeat(20 - Math.floor(percent / 5));
+  
+  const milestoneStatus = state.milestones.map(m => {
+    const icon = m.status === 'completed' ? '✅' : 
+                 m.status === 'running' ? '🔄' :
+                 m.status === 'skipped' ? '⏭️' :
+                 m.status === 'failed' ? '❌' : '⏳';
+    return `  ${icon} [${m.id}] ${m.task} ${m.status !== 'pending' ? `(${m.status})` : ''}`;
+  }).join('\n');
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'status',
+    state: state,
+    progress: {
+      bar,
+      percent,
+      completed,
+      total: state.totalMilestones
+    },
+    milestones: milestoneStatus,
+    message: `📋 任务: ${state.task}
+📊 进度: Milestone ${state.currentMilestone}/${state.totalMilestones}
+${bar} ${percent}%
+
+${milestoneStatus}`
+  }, null, 2));
+}
+
+function cmdRetry(workSessionKey) {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'retry',
+    instruction: `请向工作会话发送 retry 指令：
+
+sessions_send("${workSessionKey}", "retry")
+
+工作会话收到后将重新执行当前 milestone。`
+  }, null, 2));
+}
+
+function cmdSkip(workSessionKey) {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'skip',
+    instruction: `请向工作会话发送 skip 指令：
+
+sessions_send("${workSessionKey}", "skip")
+
+工作会话收到后将跳过当前 milestone，执行下一个。`
+  }, null, 2));
+}
+
+function cmdRollback() {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  // 找到最后一个完成的 milestone
+  const lastCompleted = [...state.milestones]
+    .reverse()
+    .find(m => m.status === 'completed');
+  
+  if (!lastCompleted) {
+    console.log(JSON.stringify({ success: false, error: '没有可回滚的 milestone' }));
+    return;
+  }
+  
+  // 重置当前和之后的 milestone
+  const rollbackId = lastCompleted.id;
+  state.milestones.forEach(m => {
+    if (m.id >= rollbackId) {
+      m.status = 'pending';
+      m.output = null;
+      m.error = null;
+    }
+  });
+  
+  state.currentMilestone = rollbackId;
+  state.lastUpdated = new Date().toISOString();
+  saveState(state);
+  
+  const workSessionKey = state.workSessionKey;
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'rollback',
+    rollbackTo: rollbackId,
+    state: state,
+    message: `已回滚到 Milestone ${rollbackId}`,
+    instruction: workSessionKey 
+      ? `请向工作会话发送 rollback 指令：
+
+sessions_send("${workSessionKey}", "rollback")
+
+工作会话收到后将恢复到 Milestone ${rollbackId}。`
+      : null
+  }, null, 2));
+}
+
+function cmdModify(workSessionKey, newDirection) {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件' }));
+    return;
+  }
+  
+  console.log(JSON.stringify({
+    success: true,
+    action: 'modify',
+    modifyContent: newDirection,
+    instruction: `请向工作会话发送 modify 指令：
+
+sessions_send("${workSessionKey}", "modify: ${newDirection}")
+
+工作会话收到后将根据新方向调整当前 milestone 并重新执行。`
+  }, null, 2));
+}
+
+function cmdRecover() {
+  const state = loadState();
+  if (!state) {
+    console.log(JSON.stringify({ success: false, error: '未找到状态文件，无法恢复' }));
+    return;
+  }
+  
+  if (state.workSessionKey) {
+    console.log(JSON.stringify({
+      success: true,
+      action: 'recover',
+      state: state,
+      message: `检测到工作会话 Key: ${state.workSessionKey}`,
+      instruction: `请尝试恢复工作会话：
+
+1. 先检查工作会话是否还存在：sessions_list
+2. 如果存在，继续执行：
+   sessions_send("${state.workSessionKey}", "continue")
+3. 如果不存在，从 Milestone ${state.currentMilestone} 重新开始：
+   - 读取 .work-session-prompt.txt
+   - sessions_spawn 启动新工作会话
+   - 更新 .milestone-state.json 的 workSessionKey`
+    }, null, 2));
+  } else {
+    console.log(JSON.stringify({
+      success: true,
+      action: 'recover',
+      state: state,
+      message: '状态文件中没有 workSessionKey，需要重新启动',
+      instruction: `请从 Milestone ${state.currentMilestone} 重新开始：
+
+1. 读取 .work-session-prompt.txt 获取 prompt
+2. sessions_spawn 启动工作会话
+3. 更新 .milestone-state.json 的 workSessionKey`
+    }, null, 2));
+  }
+}
+
+function cmdGetPrompt(task, milestonesStr) {
+  const milestones = milestonesStr.split('|').map(m => m.trim());
+  const mainSessionKey = '${MAIN_SESSION_KEY}';
+  const prompt = generateWorkSessionPrompt(task, milestones, mainSessionKey);
+  
+  console.log(prompt);
+}
+
+// ============== 主入口 ==============
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+if (!cmd) {
+  console.log(JSON.stringify({
+    error: '缺少命令',
+    usage: `
+milestone-executor <command> [args...]
+
+可用命令：
+  start "任务" "m1|m2|m3"     初始化任务并创建状态文件
+  continue <sessionKey>        继续执行下一个 milestone
+  stop <sessionKey>            停止任务
+  status                       查看当前状态
+  retry <sessionKey>           重试当前 milestone
+  skip <sessionKey>            跳过当前 milestone
+  rollback                     回滚到上一个完成的 milestone
+  modify <sessionKey> "内容"    修改当前 milestone
+  recover                      从中断恢复
+  get-prompt "任务" "m1|m2|m3"  生成工作会话 prompt（调试用）
+`
+  }));
+  process.exit(1);
+}
+
+switch (cmd) {
+  case 'start':
+    if (args.length < 3) {
+      console.log(JSON.stringify({ error: 'start 需要参数: milestone-executor start "任务" "m1|m2|m3"' }));
+      process.exit(1);
+    }
+    cmdStart(args[1], args[2]);
+    break;
+  case 'continue':
+    if (args.length < 2) {
+      console.log(JSON.stringify({ error: 'continue 需要 sessionKey 参数' }));
+      process.exit(1);
+    }
+    cmdContinue(args[1]);
+    break;
+  case 'stop':
+    if (args.length < 2) {
+      console.log(JSON.stringify({ error: 'stop 需要 sessionKey 参数' }));
+      process.exit(1);
+    }
+    cmdStop(args[1]);
+    break;
+  case 'status':
+    cmdStatus();
+    break;
+  case 'retry':
+    if (args.length < 2) {
+      console.log(JSON.stringify({ error: 'retry 需要 sessionKey 参数' }));
+      process.exit(1);
+    }
+    cmdRetry(args[1]);
+    break;
+  case 'skip':
+    if (args.length < 2) {
+      console.log(JSON.stringify({ error: 'skip 需要 sessionKey 参数' }));
+      process.exit(1);
+    }
+    cmdSkip(args[1]);
+    break;
+  case 'rollback':
+    cmdRollback();
+    break;
+  case 'modify':
+    if (args.length < 3) {
+      console.log(JSON.stringify({ error: 'modify 需要 sessionKey 和内容参数' }));
+      process.exit(1);
+    }
+    cmdModify(args[1], args[2]);
+    break;
+  case 'recover':
+    cmdRecover();
+    break;
+  case 'get-prompt':
+    if (args.length < 3) {
+      console.log(JSON.stringify({ error: 'get-prompt 需要参数: milestone-executor get-prompt "任务" "m1|m2|m3"' }));
+      process.exit(1);
+    }
+    cmdGetPrompt(args[1], args[2]);
+    break;
+  default:
+    console.log(JSON.stringify({ error: `未知命令: ${cmd}` }));
+    process.exit(1);
+}
